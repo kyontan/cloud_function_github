@@ -8,6 +8,7 @@ process.on('unhandledRejection', console.error);
 let isEnumSourceFile = git_tree_obj =>
   git_tree_obj.type === 'blob' && git_tree_obj.path.match('enums/.*.java');
 
+
 let getPlainContent = get_content_res =>
   Buffer.from(get_content_res.data.content, 'base64').toString();
 
@@ -165,7 +166,9 @@ let verifyGitHubRequst = req => {
 };
 
 /**
- * Insert rows to BigQuery, create dataset and table if not exists.
+ * Insert rows to BigQuery
+ * @note if table `tableId` exists, it will be deleted (overwritten)
+ * @note create dataset and table if not exists.
  *
  * @param projectId string
  * @param datasetId string
@@ -203,10 +206,21 @@ let insertRowsToBigQuery = (
   return bigquery
     .dataset(datasetId)
     .get({ autoCreate: true })
-    .then(([dataset]) => dataset.table(tableId).get({ autoCreate: true }))
-    .then([table] => table.insert(rows))
+    .then(([dataset]) => {
+      let table = dataset.table(tableId);
+      return table
+        .exists()
+        .then(([isExists]) => {
+          let res = Promise.resolve();
+          if (isExists)
+            res = table.delete();
+
+          return res.then(() => table.get({ schema: { fields: tableSchemaFields }, autoCreate: true })); // create table
+        })
+    })
+    .then(([table]) => table.insert(rows))
     .then(() => {
-      console.log(`Inserted ${rows.length} rows`);
+      console.log(`Inserted ${rows.length} rows into ${datasetId}.${tableId}`);
     })
     .catch(err => {
       if (err && err.name === 'PartialFailureError') {
@@ -252,6 +266,8 @@ exports.github = (req, res) => {
     let owner = req.body.repository.owner.name;
     let commit_sha = req.body.head_commit.id;
 
+    console.log({ repo: repo, owner: owner, commit_sha: commit_sha });
+
     return getAllEnumSourceFromRepository(repo, owner, commit_sha)
       .then(contents =>
         contents
@@ -261,17 +277,17 @@ exports.github = (req, res) => {
             let table_id = camelToSnakeCase(x.name);
 
             let columns = ['key', 'code', 'label'];
-            let field_types = guessSchema(x.values);
+            // takes upto 3 elements (that equals to what `columns` has)
+            let field_types = guessSchema(x.values).slice(0, 3);
 
-            // upto 3 elements (that equals to what `columns` has)
-            let bq_schema_fields = columns.map((column, i) => ({
-              name: column,
-              type: field_types[i],
+            let bq_schema_fields = field_types.map((type, i) => ({
+              name: columns[i],
+              type: type,
             }));
 
             let rows = x.values.map(values => {
               let row = {};
-              columns.map((c, i) => (row[c] = values[i]));
+              field_types.map((_, i) => (row[columns[i]] = values[i]));
               return row;
             });
 
