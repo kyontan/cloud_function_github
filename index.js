@@ -262,14 +262,16 @@ exports.github = (req, res) => {
 
             let columns = ['key', 'code', 'label'];
             let field_types = guessSchema(x.values);
-            let bq_schema_fields = field_types.map((type, i) => ({
-              name: columns[i],
-              type: type,
+
+            // upto 3 elements (that equals to what `columns` has)
+            let bq_schema_fields = columns.map((column, i) => ({
+              name: column,
+              type: field_types[i],
             }));
 
             let rows = x.values.map(values => {
               let row = {};
-              values.map((x, i) => (row[columns[i]] = x));
+              columns.map((c, i) => (row[c] = values[i]));
               return row;
             });
 
