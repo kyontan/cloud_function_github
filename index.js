@@ -202,35 +202,9 @@ let insertRowsToBigQuery = (
   // Create a new table in the dataset
   return bigquery
     .dataset(datasetId)
-    .exists()
-    .then(x => {
-      if (x[0]) {
-        console.log(`Dataset ${datasetId} found.`);
-        return bigquery.dataset(datasetId);
-      } else {
-        return Promise.resolve(bigquery.createDataset(datasetId)).then(x => {
-          console.log(`Dataset ${datasetId} created.`);
-          return x[0];
-        });
-      }
-    })
-    .then(dataset => dataset.table(tableId).exists())
-    .then(x => {
-      if (x[0]) {
-        console.log(`Table ${tableId} found.`);
-        return bigquery.dataset(datasetId).table(tableId);
-      } else {
-        return Promise.resolve(
-          bigquery
-            .dataset(datasetId)
-            .createTable(tableId, { schema: { fields: tableSchemaFields } })
-        ).then(x => {
-          console.log(`Table ${tableId} created.`);
-          return x[0];
-        });
-      }
-    })
-    .then(x => x.insert(rows))
+    .get({ autoCreate: true })
+    .then(([dataset]) => dataset.table(tableId).get({ autoCreate: true }))
+    .then([table] => table.insert(rows))
     .then(() => {
       console.log(`Inserted ${rows.length} rows`);
     })
