@@ -1,3 +1,10 @@
 {
-  "githubSecret": "some_secret_string"
+  "githubWebhookSecret": "",
+  "octokitAuthenticate": {
+  	"type": "basic",
+  	"username": "",
+  	"password": ""
+  },
+  "gcpProjectId": "",
+  "gcpDatasetId": ""
 }
