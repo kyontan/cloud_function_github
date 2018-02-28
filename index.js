@@ -1,18 +1,13 @@
-const verify = require('@octokit/webhooks/verify');
 const config = require('./config.json');
+const sequential = require('promise-sequential');
 const octokit = require('@octokit/rest')();
+const verify = require('@octokit/webhooks/verify');
 const BigQuery = require('@google-cloud/bigquery');
 
-process.on('unhandledRejection', console.error);
-
-let isEnumSourceFile = git_tree_obj =>
-  git_tree_obj.type === 'blob' && git_tree_obj.path.match('enums/.*.java');
-
-
-let getPlainContent = get_content_res =>
+const getPlainContent = get_content_res =>
   Buffer.from(get_content_res.data.content, 'base64').toString();
 
-let camelToSnakeCase = str =>
+const camelToSnakeCase = str =>
   str
     .split(/(?=[A-Z])/)
     .join('_')
@@ -23,7 +18,7 @@ let camelToSnakeCase = str =>
  * @params source_code Java Source code of enum
  * @return { name: EnumName, values: ([[ key, (code, value) ], ...] or null) } or null
  */
-let parseEnumDeclaration = source_code => {
+const parseEnumDeclaration = source_code => {
   // matches "enum...; (first semi-colon that indicates end of enum value declaration, allowed multi line)
   const re_whole_enum = / enum ([^\s]+).*?((?:\n.*?)*?);/m;
 
@@ -78,7 +73,7 @@ let parseEnumDeclaration = source_code => {
 
 /**
  * Guess schema matches to rows of data.
- * @returns [string]
+ * @returns {[string]}
  * @example
  *
  * getTypes([["something", "123"], ["string", "123"]])
@@ -99,24 +94,24 @@ let parseEnumDeclaration = source_code => {
  * getTypes([["1st column"], ["1st", "2nd"]])
  * // [ 'string', 'string' ]
  */
-let guessSchema = rows => {
-  let parseIntIfParsable = str =>
+const guessSchema = rows => {
+  const parseIntIfParsable = str =>
     /^[0-9]+$/.test(str) ? parseInt(str, 10) : str;
 
   // transpose 2d array
   // @note this transposes all columns as many as possible.
   //       transpose([[0, 1, 2], [0, 1]] // returns [[0, 0], [1, 1], [2, undefined]]
-  let transpose = a => {
-    let cols = Math.max(...a.map(x => x.length)),
-      ret = [];
+  const transpose = a => {
+    const cols = Math.max(...a.map(x => x.length));
+    let ret = [];
     for (let c = 0; c < cols; c++) {
       ret[c] = a.map(r => r[c]);
     }
     return ret;
   };
 
-  let isBoolean = x => x === 'true' || x === 'false';
-  let isNumber = x => typeof x === 'number';
+  const isBoolean = x => x === 'true' || x === 'false';
+  const isNumber = x => typeof x === 'number';
 
   return transpose(rows)
     .filter(x => x)
@@ -127,18 +122,34 @@ let guessSchema = rows => {
     });
 };
 
-let getAllEnumSourceFromRepository = (repo, owner, commit_sha) => {
+const isEnumSourceFile = git_tree_obj =>
+  git_tree_obj.type === 'blob' && git_tree_obj.path.match('enums/.*.java');
+
+/**
+ * get all sources matches filter
+ * @returns {Promise<[String]>}
+ * @param repo String
+ * @param owner String
+ * @param commit_sha String
+ * @param filter_func Function takes GitHub tree object and returns Boolean
+ *
+ * @reference https://developer.github.com/v3/git/trees/
+ * @note GitHub tree object might have keys: `path`, `mode`, `type`, `size`, `sha`, `url`
+ */
+const getSourcesFromRepository = (repo, owner, commit_sha, filter_func) => {
   octokit.authenticate(config.octokitAuthenticateOption);
   return octokit.gitdata
     .getTree({ owner: owner, repo: repo, sha: commit_sha, recursive: true })
-    .then(res_tree_ary => res_tree_ary.data.tree.filter(isEnumSourceFile))
-    .then(git_tree_ary =>
-      Promise.all(
-        git_tree_ary.map(git_tree_obj =>
+    .then(res_tree_ary =>
+      res_tree_ary.data.tree.filter(filter_func).map(x => x.path)
+    )
+    .then(paths =>
+      sequential(
+        paths.map(path => () =>
           octokit.repos.getContent({
             owner: owner,
             repo: repo,
-            path: git_tree_obj.path,
+            path: path,
             sha: commit_sha,
           })
         )
@@ -147,7 +158,86 @@ let getAllEnumSourceFromRepository = (repo, owner, commit_sha) => {
     .then(contents => contents.map(x => getPlainContent(x)));
 };
 
-// console.log(JSON.stringify(req.body, null, 4));
+/**
+ * Create BigQuery schema from Enum Values and column names
+ * @returns {[Object]}
+ * @param enum_values [[Object]]
+ * @param columns [String]
+ *
+ * @example
+ *
+ * const columns = ['key', 'code', 'label'];
+ * const enum_values = [
+ *  [ "5", "OK", "Green" ],
+ *  [ "6", "NG", "Red" ],
+ * ];
+ * enumToBigQuerySchemaFields(enum_values, columns);
+ * // returns
+ * // [
+ * //   { name: 'key', type: "integer" },
+ * //   { name: 'code', type: "string" },
+ * //   { name: 'label', type: "string" },
+ * // ]
+ *
+ * const enum_values2 = [
+ *  [ "1", "Happy" ],
+ *  [ "2", "Not happy" ],
+ * ];
+ * enumToBigQuerySchemaFields(enum_values2, columns);
+ * // returns
+ * // [
+ * //   { name: 'key', type: "integer" },
+ * //   { name: 'code', type: "string" },
+ * // ]
+ */
+const enumToBigQuerySchemaFields = (enum_values, columns) => {
+  const field_types = guessSchema(enum_values).slice(0, columns.length);
+
+  return field_types.map((type, i) => ({
+    name: columns[i],
+    type: type,
+  }));
+};
+
+/**
+ * Create rows array usable in BigQuery SDK from Enum Values and column names
+ * @returns {[Object]}
+ * @param enum_values [[Object]]
+ * @param columns [String]
+ *
+ * @example
+ *
+ * const columns = ['key', 'code', 'label'];
+ * const enum_values = [
+ *  [ "5", "OK", "Green" ],
+ *  [ "6", "NG", "Red" ],
+ * ];
+ * enumToBigQueryRows(enum_values, columns);
+ * // returns
+ * // [
+ * //   { key: "5", code: "OK", label: "Green" },
+ * //   { key: "6", code: "NG", label: "Red" },
+ * // ]
+ *
+ * const enum_values2 = [
+ *  [ "1", "Happy" ],
+ *  [ "2", "Not happy" ],
+ * ];
+ * enumToBigQueryRows(enum_values2, columns);
+ * // returns
+ * // [
+ * //   { key: "1", code: "Happy" },
+ * //   { key: "2", code: "Not happy" },
+ * // ]
+ */
+const enumToBigQueryRows = (enum_values, columns) =>
+  enum_values.map(values => {
+    let row = {};
+    columns.map((_, i) => {
+      if (values[i]) row[columns[i]] = values[i];
+    });
+    return row;
+  });
 
 /**
  * verify request using HMAC-SHA1 header: `X-Hub-Signature: sha1=deadbeaf....`
@@ -155,14 +245,14 @@ let getAllEnumSourceFromRepository = (repo, owner, commit_sha) => {
  * @param {!Object} req Clound Function request context.
  * @return Boolean whether verification of request succeed.
  */
-let verifyGitHubRequst = req => {
+const verifyGitHubRequst = (req, secret) => {
   const header_str = req.headers['x-hub-signature'];
   if (!header_str) {
     console.error('Bad request, not supplied X-Hub-Signature header');
     return false;
   }
 
-  return verify(config.githubWebhookSecret, req.rawBody, header_str);
+  return verify(secret, req.rawBody.toString(), header_str);
 };
 
 /**
@@ -193,7 +283,7 @@ let verifyGitHubRequst = req => {
  * ];
  * insertRowsToBigQuery(datasetId, tableId, tableSchemaFields, rows);
  */
-let insertRowsToBigQuery = (
+const insertRowsToBigQuery = (
   projectId,
   datasetId,
   tableId,
@@ -208,19 +298,19 @@ let insertRowsToBigQuery = (
     .get({ autoCreate: true })
     .then(([dataset]) => {
       let table = dataset.table(tableId);
-      return table
-        .exists()
-        .then(([isExists]) => {
-          let res = Promise.resolve();
-          if (isExists)
-            res = table.delete();
+      return table.exists().then(([isExists]) => {
+        let res = Promise.resolve();
+        if (isExists) res = table.delete();
 
-          return res.then(() => table.get({ schema: { fields: tableSchemaFields }, autoCreate: true })); // create table
-        })
+        return res.then(() =>
+          table.get({ schema: { fields: tableSchemaFields }, autoCreate: true })
+        ); // create table
+      });
     })
     .then(([table]) => table.insert(rows))
     .then(() => {
       console.log(`Inserted ${rows.length} rows into ${datasetId}.${tableId}`);
+      return [tableId, rows.length];
     })
     .catch(err => {
       if (err && err.name === 'PartialFailureError') {
@@ -231,6 +321,7 @@ let insertRowsToBigQuery = (
       } else {
         console.error('ERROR:', err);
       }
+      return [tableId, err];
     });
 };
 
@@ -241,19 +332,9 @@ let insertRowsToBigQuery = (
  * @param {!Object} res Cloud Function response context.
  */
 exports.github = (req, res) => {
-  console.log({
-    params: req.params,
-    query: req.query,
-    url: req.url,
-    method: req.method,
-    baseUrl: req.baseUrl,
-    _parsedUrl: req._parsedUrl,
-    headers: req.headers,
-    body: req.body,
-  });
-
-  if (!verifyGitHubRequst(req)) {
-    return res.status(400);
+  if (!verifyGitHubRequst(req, config.githubWebhookSecret)) {
+    console.error('GitHub request verification failed');
+    return res.sendStatus(400);
   }
 
   const request_event_type = req.headers['x-github-event'];
@@ -261,54 +342,54 @@ exports.github = (req, res) => {
   console.log(`request_event_type: ${request_event_type}`);
 
   if (request_event_type === 'push') {
+    if (config.targetBranch !== req.body.ref) {
+      return res.status(200).send({
+        status: 200,
+        msg: `branch ${req.body.ref} is not target branch`,
+      });
+    }
+
     // console.log(JSON.stringify(req.body, null, 4));
-    let repo = req.body.repository.name;
-    let owner = req.body.repository.owner.name;
-    let commit_sha = req.body.head_commit.id;
+    const repo = req.body.repository.name;
+    const owner = req.body.repository.owner.name;
+    const commit_sha = req.body.head_commit.id;
 
     console.log({ repo: repo, owner: owner, commit_sha: commit_sha });
 
-    return getAllEnumSourceFromRepository(repo, owner, commit_sha)
+    return getSourcesFromRepository(repo, owner, commit_sha, isEnumSourceFile)
       .then(contents =>
         contents
           .map(parseEnumDeclaration)
           .filter(x => x && x.values && 0 < x.values.length) // remove not matched
-          .map(x => {
-            let table_id = camelToSnakeCase(x.name);
+          .map(parsed_enum => {
+            const columns = ['key', 'code', 'label'];
 
-            let columns = ['key', 'code', 'label'];
-            // takes upto 3 elements (that equals to what `columns` has)
-            let field_types = guessSchema(x.values).slice(0, 3);
-
-            let bq_schema_fields = field_types.map((type, i) => ({
-              name: columns[i],
-              type: type,
-            }));
-
-            let rows = x.values.map(values => {
-              let row = {};
-              field_types.map((_, i) => (row[columns[i]] = values[i]));
-              return row;
-            });
+            const table_id = camelToSnakeCase(parsed_enum.name);
+            const bq_schema_fields = enumToBigQuerySchemaFields(
+              parsed_enum.values,
+              columns
+            );
+            const bq_rows = enumToBigQueryRows(parsed_enum.values, columns);
 
             return insertRowsToBigQuery(
               config.gcpProjectId,
               config.gcpDatasetId,
               table_id,
               bq_schema_fields,
-              rows
+              bq_rows
             );
           })
       )
-      .then(() => res.status(200).send('OK'))
+      .then(x => Promise.all(x))
+      .then(results => res.status(200).send(results))
       .catch(err => {
         console.error(err.stack);
         res.status(500).send(err.message);
       });
   } else if (request_event_type === 'ping') {
-    return res.status(200).send('OK');
+    return res.status(200).send('pong');
   } else {
     console.log(`Unknown request event type: ${request_event_type}`);
-    return res.status(400);
+    return res.sendStatus(400);
   }
 };

@@ -6,7 +6,8 @@
   "dependencies": {
     "@google-cloud/bigquery": "^1.0.0",
     "@octokit/rest": "^14.0.9",
-    "@octokit/webhooks": "^3.1.0"
+    "@octokit/webhooks": "^3.1.0",
+    "promise-sequential": "^1.1.1"
   },
   "devDependencies": {
     "eslint": "^4.18.1",
