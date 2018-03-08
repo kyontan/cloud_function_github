@@ -32,7 +32,7 @@ const parseEnumDeclaration = source_code => {
   const re_label = `(?:${re_comma}${re_literal})`;
   const re_test_enum_with_paren = new RegExp(`${re_key}\\s*\\(.*\\)`, 'g'); // for testing whether enum has parentheses
   const re_enum_with_paren = new RegExp(
-    `${re_key}\\s*\\(\\s*${re_code}${re_label}?${re_label}?${re_label}*\\s*\\)`,
+    `${re_key}\\s*\\(\\s*${re_code}${re_label}?${re_label}?.*?\\s*\\)`,
     'g'
   );
   const re_enum_without_paren = new RegExp(re_key, 'g'); // only key
@@ -326,6 +326,14 @@ const insertRowsToBigQuery = (
 };
 
 /**
+ *
+ * const array = [ { a: 2, b: 3 }, { a: 2, b: 4 }, { a: 3, b: 5 } ]
+ * uniqArrayBy(array, x => x.a)
+ * // [ { a: 2, b: 3 }, { a: 3, b: 5 } ]
+ */
+const uniqArrayBy = (array, f) => array.filter((x, pos) => array.findIndex(y => f(x) === f(y)) === pos);
+
+/**
  * Responds to any HTTP request that can handle GitHub webhook's push event
  *
  * @param {!Object} req Cloud Function request context.
@@ -357,10 +365,12 @@ exports.github = (req, res) => {
     console.log({ repo: repo, owner: owner, commit_sha: commit_sha });
 
     return getSourcesFromRepository(repo, owner, commit_sha, isEnumSourceFile)
-      .then(contents =>
-        contents
+      .then(contents => {
+        const parsed_enums = contents
           .map(parseEnumDeclaration)
-          .filter(x => x && x.values && 0 < x.values.length) // remove not matched
+          .filter(x => x && x.values && 0 < x.values.length); // remove not matched
+
+        return uniqArrayBy(parsed_enums, parsed_enum => camelToSnakeCase(parsed_enum.name))
           .map(parsed_enum => {
             const columns = ['key', 'code', 'label'];
 
@@ -379,7 +389,7 @@ exports.github = (req, res) => {
               bq_rows
             );
           })
-      )
+      })
       .then(x => Promise.all(x))
       .then(results => res.status(200).send(results))
       .catch(err => {
